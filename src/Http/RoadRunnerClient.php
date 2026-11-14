@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Spiral\RoadRunnerLaravel\Http;
 
+use Illuminate\Foundation\Application;
+use Illuminate\Http\Request;
 use Laravel\Octane\OctaneResponse;
 use Laravel\Octane\RequestContext;
 use Spiral\RoadRunner\Http\PSR7Worker;
@@ -14,6 +16,8 @@ use Symfony\Component\HttpFoundation\StreamedResponse;
  */
 final class RoadRunnerClient extends \Laravel\Octane\RoadRunner\RoadRunnerClient
 {
+    private const RESPONSE_CLOSED = 'bridgeHttpResponseClosed';
+
     public function __construct(PSR7Worker $client)
     {
         $client->chunkSize = 65536;
@@ -31,6 +35,7 @@ final class RoadRunnerClient extends \Laravel\Octane\RoadRunner\RoadRunnerClient
         }
         if ($body === null) {
             parent::respond($context, $octaneResponse);
+            $context->data[self::RESPONSE_CLOSED] = true;
             return;
         }
         if (!\is_string($body) && !$body instanceof \Generator) {
@@ -46,6 +51,18 @@ final class RoadRunnerClient extends \Laravel\Octane\RoadRunner\RoadRunnerClient
             $response->headers->all(),
         );
         $this->client->getHttpWorker()->respond($response->getStatusCode(), $body, $headers);
+        $context->data[self::RESPONSE_CLOSED] = true;
         $stream->rethrowFailure();
+    }
+
+    #[\Override]
+    public function error(\Throwable $e, Application $app, Request $request, RequestContext $context): void
+    {
+        // Octane still reports the failure, but the SDK has already sent the terminal frame.
+        if (($context->data[self::RESPONSE_CLOSED] ?? false) === true) {
+            return;
+        }
+
+        parent::error($e, $app, $request, $context);
     }
 }
