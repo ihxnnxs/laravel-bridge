@@ -12,7 +12,7 @@ use Spiral\RoadRunner\Http\PSR7Worker;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 /**
- * Keeps file bodies bounded and lets resource-owning responses stream without PSR-7 buffering.
+ * Keeps PSR-7 chunks bounded and preserves failures suppressed by the HTTP SDK.
  */
 final class RoadRunnerClient extends \Laravel\Octane\RoadRunner\RoadRunnerClient
 {
@@ -28,29 +28,31 @@ final class RoadRunnerClient extends \Laravel\Octane\RoadRunner\RoadRunnerClient
     public function respond(RequestContext $context, OctaneResponse $octaneResponse): void
     {
         $response = $octaneResponse->response;
-        $body = $response instanceof StreamableResponse ? $response->stream() : null;
-        if ($body === null && $response instanceof StreamedResponse) {
-            $callback = self::resolveStreamResponseCallback($response);
-            $body = $callback === null ? null : $callback();
-        }
-        if ($body === null) {
+        $callback = $response instanceof StreamedResponse ? self::resolveStreamResponseCallback($response) : null;
+        if ($callback === null) {
             parent::respond($context, $octaneResponse);
             $context->data[self::RESPONSE_CLOSED] = true;
             return;
         }
-        if (!\is_string($body) && !$body instanceof \Generator) {
-            throw new \UnexpectedValueException('A streaming response must return a string or Generator.');
-        }
 
         $stream = new ResponseStream();
-        if ($body instanceof \Generator) {
-            $body = $stream->wrap($body);
+        // Keep a generator callback so native Octane detects it and header conversion
+        // cannot advance the body through StreamedResponse::sendContent().
+        $response->setCallback(static function () use ($callback, $stream): \Generator {
+            $body = $callback();
+            if ($body instanceof \Generator) {
+                return yield from $stream->wrap($body);
+            }
+
+            return $body;
+        });
+
+        try {
+            parent::respond($context, $octaneResponse);
+        } finally {
+            $response->setCallback($callback);
         }
-        $headers = \array_map(
-            static fn(array $values): array => \array_filter($values, \is_string(...)),
-            $response->headers->all(),
-        );
-        $this->client->getHttpWorker()->respond($response->getStatusCode(), $body, $headers);
+
         $context->data[self::RESPONSE_CLOSED] = true;
         $stream->rethrowFailure();
     }

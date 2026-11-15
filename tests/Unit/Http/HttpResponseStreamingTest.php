@@ -19,12 +19,13 @@ use Laravel\Octane\Listeners\ReportException;
 use Laravel\Octane\OctaneResponse;
 use Laravel\Octane\RequestContext;
 use Laravel\Octane\Worker;
+use Spiral\RoadRunner\Http\Exception\StreamStoppedException;
 use Spiral\RoadRunner\Http\PSR7Worker;
 use Spiral\RoadRunner\Message\Command\StreamStop;
 use Spiral\RoadRunner\Payload;
 use Spiral\RoadRunner\StreamWorkerInterface;
+use Spiral\RoadRunnerLaravel\Http\ResponseStream;
 use Spiral\RoadRunnerLaravel\Http\RoadRunnerClient;
-use Spiral\RoadRunnerLaravel\Http\StreamableResponse;
 use Symfony\Component\HttpFoundation\BinaryFileResponse;
 use Symfony\Component\HttpFoundation\Cookie;
 use Symfony\Component\HttpFoundation\Request;
@@ -68,31 +69,103 @@ final class HttpResponseStreamingTest
         self::client($frames)->respond(new RequestContext(), new OctaneResponse($response));
 
         Assert::same(\implode('', \array_column($frames, 'body')), 'firstsecond');
-        Assert::true(\str_contains($frames[0]['headers']['set-cookie'][0], 'download=scoped'));
+        Assert::true(\str_contains($frames[0]['headers']['Set-Cookie'][0], 'download=scoped'));
+    }
+
+    public function test_generator_callback_is_restored_and_resources_release_on_completion(): void
+    {
+        $frames = [];
+        $finished = false;
+        $calls = 0;
+        $callback = static function () use (&$finished, &$calls): \Generator {
+            ++$calls;
+            try {
+                yield 'body';
+            } finally {
+                $finished = true;
+            }
+        };
+        $response = new StreamedResponse($callback);
+
+        self::client($frames)->respond(new RequestContext(), new OctaneResponse($response));
+
+        Assert::true($finished);
+        Assert::same($calls, 1);
+        Assert::same($response->getCallback(), $callback);
+        Assert::same(\implode('', \array_column($frames, 'body')), 'body');
+    }
+
+    public function test_native_string_callback_and_output_buffer_paths_are_preserved(): void
+    {
+        $frames = [];
+        $calls = 0;
+        $callback = static function () use (&$calls): string {
+            ++$calls;
+            return 'stream';
+        };
+        $response = new StreamedResponse($callback);
+        $client = self::client($frames);
+
+        $client->respond(new RequestContext(), new OctaneResponse($response, 'ignored'));
+        $client->respond(new RequestContext(), new OctaneResponse(new Response('body'), 'buffer'));
+
+        Assert::same($calls, 1);
+        Assert::same($response->getCallback(), $callback);
+        Assert::same(\implode('', \array_column($frames, 'body')), 'streambufferbody');
+    }
+
+    public function test_echo_callback_uses_native_psr7_conversion(): void
+    {
+        $frames = [];
+        $callback = static function (): void {
+            echo 'echoed';
+        };
+        $response = new StreamedResponse($callback);
+
+        self::client($frames)->respond(new RequestContext(), new OctaneResponse($response));
+
+        Assert::same(\implode('', \array_column($frames, 'body')), 'echoed');
+        Assert::same($response->getCallback(), $callback);
+    }
+
+    public function test_failure_capture_defers_cancellation_to_native_octane(): void
+    {
+        $failure = new StreamStoppedException();
+        $stream = new ResponseStream();
+        $body = $stream->wrap((static function (): \Generator {
+            yield 'body';
+        })());
+
+        Assert::same($body->current(), 'body');
+        try {
+            $body->throw($failure);
+            Assert::fail('The failure capture swallowed native cancellation.');
+        } catch (StreamStoppedException $exception) {
+            Assert::same($exception, $failure);
+        }
+        $stream->rethrowFailure();
     }
 
     public function test_resource_owning_response_releases_on_stop_without_advancing_body(): void
     {
         $frames = [];
-        $response = new class extends Response implements StreamableResponse {
-            public bool $finished = false;
-
-            public function stream(): \Generator
-            {
-                try {
-                    yield 'not-delivered';
-                    Assert::fail('Stopped stream continued executing.');
-                } finally {
-                    $this->finished = true;
-                }
+        $finished = false;
+        $response = new StreamedResponse(static function () use (&$finished): \Generator {
+            try {
+                yield 'not-delivered';
+                Assert::fail('Stopped stream continued executing.');
+            } finally {
+                $finished = true;
             }
-        };
+        });
+        $callback = $response->getCallback();
 
         self::client($frames, stop: true)->respond(new RequestContext(), new OctaneResponse($response));
 
-        Assert::true($response->finished);
+        Assert::true($finished);
         Assert::same(\implode('', \array_column($frames, 'body')), '');
         Assert::same($frames[\array_key_last($frames)]['header'], '');
+        Assert::same($response->getCallback(), $callback);
     }
 
     public function test_partial_failure_propagates_without_an_extra_error_frame_and_next_request_succeeds(): void
@@ -106,6 +179,7 @@ final class HttpResponseStreamingTest
             yield 'partial';
             throw $failure;
         });
+        $callback = $response->getCallback();
 
         try {
             $client->respond($context, new OctaneResponse($response));
@@ -119,6 +193,7 @@ final class HttpResponseStreamingTest
         Assert::same(\count($frames), 2);
         Assert::same($frames[1]['eos'], true);
         Assert::same($errors, []);
+        Assert::same($response->getCallback(), $callback);
 
         $client->respond(new RequestContext(), new OctaneResponse(new Response('healthy')));
 
@@ -194,6 +269,7 @@ final class HttpResponseStreamingTest
             throw $failure;
             yield '';
         });
+        $callback = $response->getCallback();
 
         try {
             $client->respond($context, new OctaneResponse($response));
@@ -205,6 +281,7 @@ final class HttpResponseStreamingTest
 
         Assert::same($frames, []);
         Assert::same(\count($errors), 1);
+        Assert::same($response->getCallback(), $callback);
     }
 
     public function test_transport_failure_does_not_mark_the_response_closed(): void
@@ -221,6 +298,7 @@ final class HttpResponseStreamingTest
             return 'body';
             yield '';
         });
+        $callback = $response->getCallback();
 
         try {
             $client->respond($context, new OctaneResponse($response));
@@ -229,6 +307,41 @@ final class HttpResponseStreamingTest
             Assert::same($exception, $failure);
             $client->error($exception, self::application(), IlluminateRequest::create('/download'), $context);
         }
+        Assert::same($response->getCallback(), $callback);
+    }
+
+    public function test_terminal_frame_failure_after_callback_failure_is_not_marked_closed(): void
+    {
+        $worker = \Mockery::mock(StreamWorkerInterface::class);
+        $worker->shouldReceive('withStreamMode')->once()->andReturnSelf();
+        $worker->shouldReceive('getPayload')->with(StreamStop::class)->andReturn(null);
+        $worker->shouldReceive('respond')->once()->ordered();
+        $transportFailure = new \RuntimeException('terminal frame failed');
+        $worker->shouldReceive('respond')->once()->ordered()->andThrow($transportFailure);
+        $worker->shouldReceive('error')->once()->with('Internal server error.');
+        $client = new RoadRunnerClient(new PSR7Worker($worker, new ServerRequestFactory(), new StreamFactory(), new UploadedFileFactory()));
+        $context = new RequestContext();
+        $finished = false;
+        $callback = static function () use (&$finished): \Generator {
+            try {
+                yield 'partial';
+                throw new \DomainException('callback failed');
+            } finally {
+                $finished = true;
+            }
+        };
+        $response = new StreamedResponse($callback);
+
+        try {
+            $client->respond($context, new OctaneResponse($response));
+            Assert::fail('The terminal frame failure was swallowed.');
+        } catch (\RuntimeException $exception) {
+            Assert::same($exception, $transportFailure);
+            $client->error($exception, self::application(), IlluminateRequest::create('/download'), $context);
+        }
+
+        Assert::true($finished);
+        Assert::same($response->getCallback(), $callback);
     }
 
     private static function application(): Application

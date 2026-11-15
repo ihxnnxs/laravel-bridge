@@ -6,6 +6,7 @@ namespace Spiral\RoadRunnerLaravel\Tests\Unit\Temporal\Interceptor;
 
 use Illuminate\Container\Container;
 use Illuminate\Foundation\Application;
+use Illuminate\Http\Request;
 use Spiral\RoadRunnerLaravel\Temporal\Interceptor\HandleActivityInterceptor;
 use Temporal\DataConverter\EncodedValues;
 use Temporal\Interceptor\ActivityInbound\ActivityInput;
@@ -41,7 +42,9 @@ final class HandleActivityInterceptorTest
     private static function handle(callable $activity): mixed
     {
         $previous = Container::getInstance();
-        Container::setInstance(new Application(\sys_get_temp_dir()));
+        $app = new Application(\sys_get_temp_dir());
+        $app->instance('request', Request::create('/'));
+        Container::setInstance($app);
 
         try {
             return (new HandleActivityInterceptor())->handleActivityInbound(

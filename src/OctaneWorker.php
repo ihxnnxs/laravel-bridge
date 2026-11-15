@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Spiral\RoadRunnerLaravel;
 
 use Illuminate\Foundation\Application;
+use Illuminate\Http\Request;
 use Laravel\Octane\ApplicationFactory;
 use Laravel\Octane\Contracts\Client;
 use Laravel\Octane\Events\WorkerStarting;
@@ -25,16 +26,15 @@ final class OctaneWorker extends Worker
     #[\Override]
     public function boot(array $initialInstances = [], ?Application $application = null): void
     {
-        // First we will create an instance of the Laravel application that can serve as
-        // the base container instance we will clone from on every request. This will
-        // also perform the initial bootstrapping that's required by the framework.
-        $this->app = $app = $application ?? $this->appFactory->createApplication(
-            \array_merge(
-                $initialInstances,
-                [Client::class => $this->client],
-            ),
-        );
+        if ($application === null) {
+            parent::boot($initialInstances);
+            return;
+        }
 
-        $this->dispatchEvent($app, new WorkerStarting($app));
+        // Temporal activities already have a booted application.
+        $this->app = $application;
+        $this->bootRequest = $application->make(Request::class);
+
+        $this->dispatchEvent($application, new WorkerStarting($application));
     }
 }

@@ -23,6 +23,10 @@ final readonly class HttpWorker implements WorkerInterface
     #[\Override]
     public function start(WorkerOptionsInterface $options): void
     {
+        // Laravel preserves generator callbacks under Octane. Set this before the
+        // HTTP SDK caches server globals, so every request keeps the native path.
+        $_SERVER['LARAVEL_OCTANE'] = true;
+
         $roadRunnerClient = new RoadRunnerClient(
             $psr7Client = new PSR7Worker(
                 new RoadRunnerWorker(Relay::create($options->getRelayDsn())),
@@ -50,6 +54,10 @@ final readonly class HttpWorker implements WorkerInterface
                 ]));
 
                 $worker->handle($request, $context);
+
+                unset($psr7Request, $request, $context);
+
+                $worker->operationReleased();
             }
         } catch (\Throwable $e) {
             if (!$e instanceof RelayException) {

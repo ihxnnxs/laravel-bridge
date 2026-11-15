@@ -17,8 +17,9 @@ final class ResponseStream
     {
         try {
             return yield from $body;
-        } catch (StreamStoppedException) {
-            // Let the HTTP SDK acknowledge cancellation after the body's finally blocks run.
+        } catch (StreamStoppedException $exception) {
+            // Native Octane owns cancellation and the SDK's stop acknowledgement.
+            throw $exception;
         } catch (\Throwable $exception) {
             $this->failure = $exception;
             throw $exception;
